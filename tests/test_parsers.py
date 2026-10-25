@@ -3,6 +3,7 @@ import json
 import sys
 from pathlib import Path
 
+import httpx
 import pymupdf
 import pytest
 
@@ -217,3 +218,119 @@ def test_two_figures_on_one_page_and_repeated_logo(tmp_path, monkeypatch):
     assert a[1] > 95 and b[1] > 95          # 로고(y≤95)가 크롭에 들어가지 않음
     assert a[3] < 400 and b[1] > 340         # 첫 그림은 둘째 그림 전에서, 둘째는 첫 캡션 뒤에서 끊김
     assert a[3] > 350 and b[3] > 620         # 각자 자기 캡션은 포함
+
+
+# ---------- 리뷰 반영 ----------
+
+def _two_figure_doc(second_withheld, third=True):
+    doc = pymupdf.open()
+    for k in range(4):
+        _page_with_header(doc, f"3.4-{k + 1}")
+    p = doc[3]
+    for k in range(5):
+        p.draw_rect(pymupdf.Rect(120 + 60 * k, 120, 160 + 60 * k, 300), color=(0, 0, 1))
+    p.insert_text((180, 330), "Figure 3.4-5: Public Chart", fontsize=11)
+    if second_withheld:
+        p.insert_text((200, 450), "{{ Withheld - See Part 9 }}", fontsize=11)
+    else:
+        for k in range(5):
+            p.draw_rect(pymupdf.Rect(120 + 60 * k, 380, 160 + 60 * k, 560), color=(1, 0, 0))
+    p.insert_text((180, 600), "Figure 3.4-6: Second Chart", fontsize=11)
+    if third:
+        q = doc[2]
+        for k in range(5):
+            q.draw_rect(pymupdf.Rect(120 + 60 * k, 120, 160 + 60 * k, 300))
+        q.insert_text((180, 330), "Figure 3.4-7: Third Chart", fontsize=11)
+    return doc.tobytes()
+
+
+def _fresh_dir(tmp_path, data):
+    d = tmp_path / "docs" / "t"
+    d.mkdir(parents=True, exist_ok=True)
+    for p in d.glob("*.pdf"):
+        p.chmod(0o644)
+        p.unlink()
+    for p in d.glob("*.json"):
+        if p.name != "doc.json":
+            p.unlink()
+    (d / "doc.json").write_text(json.dumps({"reactor": "t", "title": "t"}))
+    fetch.store(data, {"url": "x"}, d)
+    return d
+
+
+def test_withheld_judged_per_figure_not_per_page(tmp_path, monkeypatch):
+    monkeypatch.setattr(extract, "ROOT", tmp_path)
+    rows, _ = extract.run(_fresh_dir(tmp_path, _two_figure_doc(second_withheld=True)))
+    by = {r["fig_no"]: r for r in rows}
+    assert by["3.4-5"]["status"] == "public"
+    assert (by["3.4-6"]["status"], by["3.4-6"]["reason"]) == ("withheld", "text:Withheld")
+
+
+def test_rerun_removes_stale_outputs(tmp_path, monkeypatch):
+    monkeypatch.setattr(extract, "ROOT", tmp_path)
+    d = _fresh_dir(tmp_path, _two_figure_doc(second_withheld=False))
+    extract.run(d)
+    assert (d / "figures" / "t-fig-3.4-6.png").exists() and (d / "figures" / "t-fig-3.4-7.json").exists()
+    d = _fresh_dir(tmp_path, _two_figure_doc(second_withheld=True, third=False))
+    extract.run(d)
+    left = sorted(p.name for p in (d / "figures").iterdir())
+    assert left == ["t-fig-3.4-5.json", "t-fig-3.4-5.png", "t-fig-3.4-6.json"]
+
+
+def test_run_skips_broken_folder(tmp_path):
+    d = tmp_path / "broken"
+    d.mkdir()
+    with pytest.raises(extract.SkipDoc):
+        extract.run(d)
+    (d / "doc.json").write_text("{}")
+    with pytest.raises(extract.SkipDoc, match="PDF 0개"):
+        extract.run(d)
+
+
+def test_doc_dir_refuses_other_document_before_writing(tmp_path, monkeypatch):
+    monkeypatch.setattr(fetch, "DOCS", tmp_path)
+    fetch.doc_dir("xe100-tr", {"adams_no": "ML22195A260", "title": "old"})
+    with pytest.raises(ValueError, match="ML22195A260"):
+        fetch.doc_dir("xe100-tr", {"adams_no": "ML21288A173", "title": "new"})
+    assert json.loads((tmp_path / "xe100-tr" / "doc.json").read_text())["title"] == "old"
+    fetch.doc_dir("xe100-tr", {"adams_no": "ML22195A260", "title": "again"})  # 같은 문서는 다시 받기 허용
+
+
+@pytest.mark.parametrize("status,allowed", [(200, True), (404, True), (401, False), (403, False)])
+def test_robots_status_rules(status, allowed):
+    rp = fetch.parse_robots(status, "User-agent: *\nDisallow: /private/\n")
+    assert rp.can_fetch(fetch.AGENT, "https://example.org/docs/a.pdf") is allowed
+    assert not fetch.parse_robots(200, "User-agent: *\nDisallow: /docs/\n").can_fetch(fetch.AGENT, "https://e.org/docs/a")
+
+
+def test_html_block_page_is_blocked(tmp_path, monkeypatch):
+    monkeypatch.setenv("SMR_CONTACT_EMAIL", "test@example.org")
+    monkeypatch.setattr(fetch, "MIN_INTERVAL", 0)
+    monkeypatch.setattr(fetch, "_robots", {})
+
+    def handler(req):
+        if req.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, html="<html>Access Denied</html>")
+    with fetch.client(transport=httpx.MockTransport(handler)) as c:
+        with pytest.raises(fetch.Blocked, match="PDF가 아닌 응답"):
+            fetch.download(c, "https://example.org/a.pdf", tmp_path)
+    assert not list(tmp_path.iterdir())
+
+
+def test_client_requires_contact(monkeypatch):
+    monkeypatch.delenv("SMR_CONTACT_EMAIL", raising=False)
+    with pytest.raises(SystemExit):
+        fetch.client()
+
+
+def test_repeated_withheld_marker_near_edge_keeps_reason(tmp_path, monkeypatch):
+    """여러 쪽 같은 자리에 반복되는 '{{ Withheld }}' 가 머리글로 분류돼도 판정 이유는 text:Withheld."""
+    monkeypatch.setattr(extract, "ROOT", tmp_path)
+    doc = pymupdf.open()
+    for k in range(4):
+        p = _page_with_header(doc, f"1.2-{k + 1}")
+        p.insert_text((150, 90), f"Figure 1.2-{k + 1}: Building Elevation {k}", fontsize=11)
+        p.insert_text((350, 105), "{{  Withheld - See Part 9  }}", fontsize=9)
+    rows, _ = extract.run(_fresh_dir(tmp_path, doc.tobytes()))
+    assert {(r["status"], r["reason"]) for r in rows} == {("withheld", "text:Withheld")}

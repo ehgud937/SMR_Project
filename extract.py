@@ -4,6 +4,7 @@ import collections
 import csv
 import json
 import re
+import shutil
 from pathlib import Path
 
 import imagehash
@@ -25,7 +26,7 @@ TOC_HEAD = re.compile(r"^\s*(TABLE OF CONTENTS|LIST OF TABLES|CONTENTS)\s*$", re
 CAPTION = re.compile(rf"^\s*Figure\s+{FIGNO}{SHEET}\s*[:.]\s*(.*)$")
 OTHER_CAPTION = re.compile(rf"^\s*(Figure|Table)\s+\S+{SHEET}\s*[:.]", re.I)
 PAGE_LABEL = re.compile(r"(\d+(\.\d+)*-\d+|[ivxlc]+)|(\d+) of \d+")
-WITHHELD = re.compile(r"\bWithheld\b")
+WITHHELD = re.compile(r"\b(Withheld|WITHHELD)\b")
 WITHHELD_NOTICE = re.compile(r"\b(withheld|security[- ]related|SUNSI)\b", re.I)  # 그림 대신 들어간 안내문
 
 # Word 변환 PDF 중에 공백이 \x03, 하이픈이 U+0372 로 나오는 것이 있음
@@ -261,8 +262,10 @@ def figure_band(page, body, crect, page_caps, skip_xrefs):
     return body & pymupdf.Rect(body.x0, y0, body.x1, y1)
 
 
-def judge_and_crop(page, body, caption_rect, out_png, rotation=0, skip_xrefs=frozenset()):
-    text = ptext(page)
+def judge_and_crop(page, body, caption_rect, out_png, rotation=0, skip_xrefs=frozenset(), judge_area=None):
+    # 판정 글자는 judge_area 안에서만. 머리글 판정과 섞이지 않게 body 대신 따로 받는다
+    area = judge_area or page.rect
+    text = "\n".join(t for t, r in page_lines(page) if r.intersects(area))
     if WITHHELD.search(text):
         return {"status": "withheld", "reason": "text:Withheld"}
     vec, ras, bars = content_boxes(page, body, caption_rect, skip_xrefs)
@@ -309,12 +312,23 @@ def judge_and_crop(page, body, caption_rect, out_png, rotation=0, skip_xrefs=fro
             "phash": str(imagehash.phash(im))}
 
 
+class SkipDoc(Exception):
+    pass
+
+
 def run(doc_dir):
+    pdfs = list(doc_dir.glob("*.pdf"))
+    if not (doc_dir / "doc.json").exists():
+        raise SkipDoc("doc.json 없음")
+    if len(pdfs) != 1:
+        raise SkipDoc(f"PDF {len(pdfs)}개")
     meta = json.loads((doc_dir / "doc.json").read_text())
-    (pdf_path,) = doc_dir.glob("*.pdf")
+    pdf_path = pdfs[0]
     prov = json.loads(pdf_path.with_suffix(".json").read_text())
+    # 3: 지난 결과를 지우고 새로 만든다 (사라진 그림, 비공개로 바뀐 그림의 이미지가 남지 않게)
     fig_dir = doc_dir / "figures"
-    fig_dir.mkdir(exist_ok=True)
+    shutil.rmtree(fig_dir, ignore_errors=True)
+    fig_dir.mkdir()
     doc = pymupdf.open(pdf_path)
 
     lof_p = find_lof_pages(doc)
@@ -356,8 +370,11 @@ def run(doc_dir):
             sheet = f" (sheet {e['sheet']})" if e["sheet"] else ""
             row.update(pdf_page=i + 1, printed_page=labels[i], caption=f"Figure {e['fig_no']}{sheet}: {cap}",
                        other_caption_pages=[c[0] + 1 for c in cands if c[0] != i])
-            body = figure_band(page, body_of(page), crect, page_caps[i], logos)
-            row.update(judge_and_crop(page, body, crect, fig_dir / f"{fid}.png", rotations[i], logos))
+            full = body_of(page)
+            body = figure_band(page, full, crect, page_caps[i], logos)
+            # 한 쪽에 그림이 여럿이면 이 그림의 세로 구간만 보고 비공개를 판정
+            area = page.rect if body == full else pymupdf.Rect(page.rect.x0, body.y0, page.rect.x1, body.y1)
+            row.update(judge_and_crop(page, body, crect, fig_dir / f"{fid}.png", rotations[i], logos, area))
             if row["status"] == "public":
                 row["crop_path"] = str((fig_dir / f"{fid}.png").relative_to(ROOT))
         (fig_dir / f"{fid}.json").write_text(json.dumps(row, ensure_ascii=False, indent=2))
@@ -375,10 +392,13 @@ def _write_csv(path, rows):
 def write_index():
     """문서별 figures.csv 와 전체 data/index.csv"""
     all_rows = []
-    for d in sorted(DOCS.iterdir()):
-        if rows := [json.loads(p.read_text()) for p in sorted((d / "figures").glob("*.json"))]:
+    for d in sorted(p for p in DOCS.iterdir() if p.is_dir()):
+        rows = [json.loads(p.read_text()) for p in sorted((d / "figures").glob("*.json"))]
+        if rows:
             _write_csv(d / "figures.csv", rows)
             all_rows += rows
+        else:
+            (d / "figures.csv").unlink(missing_ok=True)
     _write_csv(DOCS.parent / "index.csv", all_rows)
     return len(all_rows)
 
@@ -387,11 +407,19 @@ def main():
     ap = argparse.ArgumentParser(description="SMR 문서에서 도면 추출")
     ap.add_argument("names", nargs="*", help="data/docs 아래 문서 폴더 이름. 생략하면 전부")
     names = ap.parse_args().names or sorted(p.name for p in DOCS.iterdir() if p.is_dir())
+    skipped = []
     for name in names:
-        rows, info = run(DOCS / name)
+        try:
+            rows, info = run(DOCS / name)
+        except SkipDoc as e:
+            skipped.append(name)
+            print(f"{name}: 건너뜀 ({e})")
+            continue
         stat = dict(collections.Counter(r["status"] for r in rows))
         print(f"{name}: 그림 목록 {info['lof_entries']}개, {stat}")
     print("index.csv:", write_index(), "행")
+    if skipped:
+        raise SystemExit(f"건너뛴 문서 {len(skipped)}개: {', '.join(skipped)}")
 
 
 if __name__ == "__main__":

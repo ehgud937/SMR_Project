@@ -19,8 +19,7 @@ ROOT = Path(__file__).parent
 DOCS = ROOT / "data" / "docs"
 load_dotenv(ROOT / ".env")
 
-UA = ("SMR-figure-research/0.1 (internal research use of public licensing documents; "
-      f"contact: {os.environ.get('SMR_CONTACT_EMAIL', 'unset')})")
+AGENT = "SMR-figure-research"
 MIN_INTERVAL = 3.0  # 같은 호스트 요청 간격(초)
 RETRY_STATUS = {429, 500, 502, 503, 504}
 ADAMS_API = "https://adams-api.nrc.gov/aps/api/search"
@@ -47,8 +46,12 @@ class Blocked(Exception):
     pass
 
 
-def client():
-    return httpx.Client(headers={"User-Agent": UA}, timeout=120, follow_redirects=True)
+def client(**kw):
+    contact = os.environ.get("SMR_CONTACT_EMAIL")
+    if not contact:
+        sys.exit(".env 에 SMR_CONTACT_EMAIL 을 넣어야 함 (User-Agent 연락처)")
+    ua = f"{AGENT}/0.1 (internal research use of public licensing documents; contact: {contact})"
+    return httpx.Client(headers={"User-Agent": ua}, timeout=120, follow_redirects=True, **kw)
 
 
 def polite_get(c, url, headers=None):
@@ -70,14 +73,24 @@ def polite_get(c, url, headers=None):
     raise RuntimeError(f"{url}: 3회 재시도 실패 ({err})")
 
 
+def parse_robots(status, text):
+    """RobotFileParser.read() 와 같은 규칙: 401·403 은 전부 금지, 그 밖의 4xx 는 전부 허용."""
+    rp = RobotFileParser()
+    if status in (401, 403):
+        rp.disallow_all = True
+    elif status >= 400:
+        rp.allow_all = True
+    else:
+        rp.parse(text.splitlines())
+    return rp
+
+
 def robots_ok(c, url):
     s = urlsplit(url)
     if s.netloc not in _robots:
-        rp = RobotFileParser()
         r = polite_get(c, f"{s.scheme}://{s.netloc}/robots.txt")
-        rp.parse(r.text.splitlines() if r.status_code == 200 else [])
-        _robots[s.netloc] = rp
-    return _robots[s.netloc].can_fetch(UA, url)
+        _robots[s.netloc] = parse_robots(r.status_code, r.text)
+    return _robots[s.netloc].can_fetch(AGENT, url)
 
 
 def resolve(c, ml):
@@ -110,6 +123,10 @@ def slug_from_adams(doc):
 
 def doc_dir(name, meta=None):
     d = DOCS / name
+    if meta and (d / "doc.json").exists():
+        old = json.loads((d / "doc.json").read_text()).get("adams_no")
+        if old != meta.get("adams_no"):
+            raise ValueError(f"{name} 에는 이미 다른 문서({old})가 있음. 다른 약칭을 지정해야 함")
     d.mkdir(parents=True, exist_ok=True)
     if meta:
         (d / "doc.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
@@ -148,6 +165,8 @@ def download(c, url, d):
     r = polite_get(c, url)
     if r.status_code != 200:
         raise Blocked(f"HTTP {r.status_code}: {url}")
+    if not r.content.startswith(b"%PDF"):
+        raise Blocked(f"PDF가 아닌 응답({r.headers.get('content-type')}): {url}")
     return store(r.content, {"url": url, "final_url": str(r.url), "fetched_at": now(), "acquired_via": "download",
                              "http_status": r.status_code, "response_headers": dict(r.headers)}, d)
 
@@ -191,6 +210,8 @@ def main():
                 pdf, prov = download(c, meta["Url"], d)
     except Blocked as e:
         sys.exit(f"차단됨: {e}\n직접 받아 data/inbox/ 에 넣고 --import 로 등록하면 됨")
+    except ValueError as e:
+        sys.exit(str(e))
     print(pdf.relative_to(ROOT), prov["page_count"], "쪽")
 
 
